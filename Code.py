@@ -1,215 +1,157 @@
-import streamlit as st
-import requests
-import pandas as pd
-from datetime import datetime
-import tempfile
-import time
-import plotly.express as px
-import base64
+import streamlit as st, requests, re, pandas as pd, json
 
-# --- 1. UI SETUP ---
-st.set_page_config(page_title="Libraries Scanner", layout="wide", page_icon="📦")
-st.title("📦 Libraries Scanner")
-st.markdown("Live Vulnerability (CVE) & Health Scanning Engine")
+st.set_page_config(page_title="Lib-Pro Scanner", layout="wide", page_icon="📦")
+st.markdown("<style>.stMetric { background-color: #1e293b; padding: 15px; border-radius: 10px; border: 1px solid #334155; } div.stForm { background-color: #1e293b; border: 1px solid #334155; border-radius: 10px; }</style>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center;'>📦 Lib-Pro Scanner</h1><br>", unsafe_allow_html=True)
 
-# --- 2. SECURITY ENGINE ---
-def check_vulnerabilities(package, version, ecosystem):
-    url = "https://api.osv.dev/v1/query"
-    payload = {"version": version, "package": {"name": package, "ecosystem": ecosystem}}
-    for _ in range(2): 
-        try:
-            r = requests.post(url, json=payload, timeout=7)
-            if r.status_code == 200:
-                data = r.json()
-                count = len(data.get("vulns", []))
-                return f"🚨 {count} CVEs" if count > 0 else "✅ Secure"
-        except:
-            time.sleep(1)
-    return "✅ Secure"
-
-def classify_owner(name):
-    if not name or name == "N/A": return "Unknown"
-    org_k = ['team', 'foundation', 'project', 'org', 'inc', 'llc', 'group', 'maintainers']
-    if any(k in str(name).lower() for k in org_k): return f"{name} (Organization)"
-    return f"{name} (Individual)"
-
-def get_health_status(date_str):
-    if date_str in ["N/A", "Unknown", None]: return "❌ Not Found"
+def check_vuln(pkg, ver, eco):
     try:
-        days = (datetime.now() - datetime.strptime(date_str, '%Y-%m-%d')).days
-        if days <= 180: return "✅ Healthy"
-        elif days <= 365: return "⚠️ Warning"
-        else: return "❌ Outdated"
-    except: return "❌ Error"
+        payload = {"package": {"name": pkg, "ecosystem": eco}}
+        if ver and ver != "Unknown": payload["version"] = ver
+        r = requests.post("https://api.osv.dev/v1/query", json=payload, timeout=15)
+        if r.status_code != 200: return f"API_ERROR_{r.status_code}", ""
+        v = r.json().get("vulns", [])
+        if not v: return "Secure", "No known CVEs"
+        c = list(dict.fromkeys([next((a for a in (x.get("aliases") or []) if a.startswith("CVE")), x.get("id")) for x in v]))
+        return f"Vulnerable ({len(v)})", ", ".join(c[:3]) + ("..." if len(c)>3 else "")
+    except Exception as e: return "Timeout_Error", str(e)[:20]
 
-# --- 3. PDF GENERATOR ---
-def create_pdf(df):
-    try: 
-        from fpdf import FPDF
-    except ImportError: 
-        return None
-    def clean_text(text):
-        text = str(text).replace("✅", "").replace("❌", "").replace("⚠️", "").replace("🚨", "")
-        return text.encode('latin-1', 'ignore').decode('latin-1').strip()
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(190, 10, "Libraries Scanner - Audit Report", ln=True, align='C')
-    pdf.ln(5)
-    pdf.set_font("Arial", 'B', 10)
-    cols, w = ["Library", "Health", "Version", "Security", "Owner"], [45, 30, 20, 25, 70]
-    for c, width in zip(cols, w): pdf.cell(width, 10, c, 1, 0, 'C')
-    pdf.ln()
-    pdf.set_font("Arial", '', 9)
-    for _, row in df.iterrows():
-        pdf.cell(w[0], 10, clean_text(row['Library'])[:25], 1)
-        pdf.cell(w[1], 10, clean_text(row['Health Status'])[:15], 1)
-        pdf.cell(w[2], 10, clean_text(row['Version'])[:10], 1, 0, 'C')
-        pdf.cell(w[3], 10, clean_text(row['Vulnerabilities'])[:15], 1, 0, 'C')
-        pdf.cell(w[4], 10, clean_text(row['Owner'])[:38], 1); pdf.ln()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        pdf.output(tmp.name)
-        with open(tmp.name, "rb") as f: return f.read()
-
-# --- 4. DATA FETCHING ---
-@st.cache_data(ttl=60)
-def get_pypi_data(package):
-    pkg = str(package).strip().lower()
-    try:
-        r = requests.get(f"https://pypi.org/pypi/{pkg}/json", timeout=7)
-        if r.status_code == 200:
-            data = r.json()
-            ver = data['info']['version']
-            upd = data['releases'].get(ver, [{}])[0].get('upload_time', 'Unknown').split('T')[0]
-            owner = classify_owner(data['info'].get('author') or "Community")
-            urls = data['info'].get('project_urls') or {}
-            src = urls.get('Source') or urls.get('Repository') or urls.get('Homepage')
-            cve = check_vulnerabilities(pkg, ver, "PyPI")
-            return {
-                "Library": pkg, 
-                "Health Status": get_health_status(upd), 
-                "Vulnerabilities": cve, 
-                "Version": ver, 
-                "Last Updated": upd, 
-                "Owner": owner, 
-                "Source": src, 
-                "Registry": "PyPI"
-            }
-    except: return None
-    return None
-
-@st.cache_data(ttl=60)
-def get_npm_data(package):
-    pkg = str(package).strip().lower()
-    try:
-        r = requests.get(f"https://registry.npmjs.org/{pkg}", timeout=7)
-        if r.status_code == 200:
-            data = r.json()
-            ver = data['dist-tags']['latest']
-            upd = data['time'].get(ver, "").split('T')[0]
-            raw_auth = data.get('author')
-            auth = raw_auth.get('name') if isinstance(raw_auth, dict) else raw_auth
-            raw_repo = data.get('repository', {})
-            src = raw_repo.get('url', '') if isinstance(raw_repo, dict) else raw_repo
-            cve = check_vulnerabilities(pkg, ver, "npm")
-            return {
-                "Library": pkg, 
-                "Health Status": get_health_status(upd), 
-                "Vulnerabilities": cve, 
-                "Version": ver, 
-                "Last Updated": upd, 
-                "Owner": classify_owner(auth or "Community"), 
-                "Source": str(src).replace('git+', ''), 
-                "Registry": "NPM"
-            }
-    except: return None
-    return None
-
-# --- 5. INTERFACE ---
-with st.sidebar:
-    # --- CUSTOM DRAWN CYBER LOGO ---
-    svg_logo = """
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
-      <defs>
-        <filter id="neonGlow" x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur stdDeviation="3" result="blur"/>
-          <feMerge>
-            <feMergeNode in="blur"/>
-            <feMergeNode in="SourceGraphic"/>
-          </feMerge>
-        </filter>
-      </defs>
-      <circle cx="100" cy="100" r="85" fill="none" stroke="#38bdf8" stroke-width="2" stroke-dasharray="15 10" opacity="0.7"/>
-      <circle cx="100" cy="100" r="65" fill="none" stroke="#00FF41" stroke-width="4" stroke-dasharray="40 10 5 10" filter="url(#neonGlow)"/>
-      <polygon points="85,65 135,100 85,135" fill="none" stroke="#E0E0E0" stroke-width="4" filter="url(#neonGlow)"/>
-      <circle cx="95" cy="100" r="12" fill="#00FF41" filter="url(#neonGlow)"/>
-      <line x1="15" y1="100" x2="35" y2="100" stroke="#38bdf8" stroke-width="3"/>
-      <line x1="185" y1="100" x2="165" y2="100" stroke="#38bdf8" stroke-width="3"/>
-      <line x1="100" y1="15" x2="100" y2="35" stroke="#38bdf8" stroke-width="3"/>
-      <line x1="100" y1="185" x2="100" y2="165" stroke="#38bdf8" stroke-width="3"/>
-    </svg>
-    """
-    b64_svg = base64.b64encode(svg_logo.encode('utf-8')).decode('utf-8')
-    st.markdown(f'<img src="data:image/svg+xml;base64,{b64_svg}" width="120" style="display:block; margin:auto; margin-bottom: 20px;">', unsafe_allow_html=True)
+def fetch_data(pkg_in):
+    res = []; s = str(pkg_in).strip().lower()
+    p, tv = (s.rsplit('@', 1)[0], s.rsplit('@', 1)[1]) if '@' in s and not (s.startswith('@') and s.count('@')==1) else (s, None)
     
-    st.title("System Controls")
+    if True: # PyPI
+        try:
+            r = requests.get(f"https://pypi.org/pypi/{p}/json", timeout=10)
+            if r.status_code == 200:
+                i = r.json().get('info',{}); v = tv if tv else i.get('version','Unknown')
+                src = (i.get('project_urls') or {}).get('Source') or f"https://pypi.org/project/{p}/"
+                desc = i.get('summary', 'No description provided.')
+                vul, vdt = check_vuln(p, tv, "PyPI")
+                res.append({"Library": p, "Version": v, "Registry": "PyPI", "Status": vul, "Threat Intel": vdt, "Description": desc, "Source": src})
+        except: pass
+        
+    if True: # NPM
+        try:
+            r = requests.get(f"https://registry.npmjs.org/{p}", timeout=10)
+            if r.status_code == 200:
+                d = r.json(); v = tv if tv else d.get('dist-tags',{}).get('latest','Unknown')
+                repo = d.get('repository',{}); src = repo.get('url','') if isinstance(repo,dict) else repo
+                desc = d.get('description', 'No description provided.')
+                vul, vdt = check_vuln(p, tv, "npm")
+                res.append({"Library": p, "Version": v, "Registry": "NPM", "Status": vul, "Threat Intel": vdt, "Description": desc, "Source": src})
+        except: pass
+        
+    if True: # NuGet
+        try:
+            r = requests.get(f"https://azuresearch-usnc.nuget.org/query?q={p}&take=5", timeout=10)
+            if r.status_code == 200:
+                em = next((x for x in r.json().get('data',[]) if x.get('id','').lower() == p), None)
+                if em:
+                    v = tv if tv else em.get('version','Unknown'); src = em.get('projectUrl') or f"https://www.nuget.org/packages/{p}"
+                    desc = em.get('description', 'No description provided.')
+                    vul, vdt = check_vuln(em.get('id'), tv, "NuGet")
+                    res.append({"Library": em.get('id'), "Version": v, "Registry": "NuGet", "Status": vul, "Threat Intel": vdt, "Description": desc, "Source": src})
+        except: pass
+    return res
+def parse_uploaded_file(file):
+    extracted = []
+    try:
+        if file.name.endswith(".json"):
+            data = json.load(file)
+            deps = {**data.get('dependencies', {}), **data.get('devDependencies', {})}
+            extracted = [f"{k}@{v.strip('^~><=')}" for k, v in deps.items()]
+        elif file.name.endswith(".txt"):
+            for line in file.getvalue().decode("utf-8").splitlines():
+                clean = line.split('#')[0].split(';')[0].strip()
+                m = re.match(r'^([a-zA-Z0-9_\-]+)(?:[=<>~]+([0-9\.]+))?', clean)
+                if m: extracted.append(f"{m.group(1)}@{m.group(2)}" if m.group(2) else m.group(1))
+    except Exception as e: st.error(f"File Error: {e}")
+    return extracted
+
+def fetch_github_repo(url):
+    extracted = []
+    match = re.search(r"github\.com/([^/]+)/([^/]+)", url)
+    if not match: return []
+    owner, repo = match.groups()
+    repo = repo.replace(".git", "")
+    
+    try:
+        r = requests.get(f"https://api.github.com/repos/{owner}/{repo}", timeout=10)
+        if r.status_code != 200: 
+            st.warning("⚠️ GitHub Repo not found or API rate limit reached.")
+            return []
+        branch = r.json().get("default_branch", "main")
+        
+        req_r = requests.get(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/requirements.txt", timeout=10)
+        if req_r.status_code == 200:
+            for line in req_r.text.splitlines():
+                clean = line.split('#')[0].split(';')[0].strip()
+                m = re.match(r'^([a-zA-Z0-9_\-]+)(?:[=<>~]+([0-9\.]+))?', clean)
+                if m: extracted.append(f"{m.group(1)}@{m.group(2)}" if m.group(2) else m.group(1))
+                
+        pkg_r = requests.get(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/package.json", timeout=10)
+        if pkg_r.status_code == 200:
+            data = pkg_r.json()
+            deps = {**data.get('dependencies', {}), **data.get('devDependencies', {})}
+            extracted.extend([f"{k}@{str(v).strip('^~><=')}" for k, v in deps.items()])
+            
+    except Exception as e: st.error(f"GitHub Error: {e}")
+    return extracted
+
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
     with st.form("audit_form"):
-        libs_input = st.text_area("Target Assets (e.g. axios, pandas):", "axios, requests, pandas", height=150)
-        run_btn = st.form_submit_button("🚀 Execute Scan", use_container_width=True)
+        st.markdown("### 🎯 Target Acquisition")
+        github_url = st.text_input("🌐 Paste a public GitHub Repository URL:")
+        uploaded_file = st.file_uploader("📂 Drop requirements.txt or package.json:", type=["txt", "json"])
+        libs_input = st.text_area("✍️ Or type manually (comma separated):", "lodash, django@1.11.0", height=68)
+        run_btn = st.form_submit_button("🚀 Run Lib-Pro Scan", type="primary", use_container_width=True)
 
 if run_btn:
-    lib_list = [l.strip() for l in libs_input.split(",") if l.strip()]
-    results = []
-    with st.spinner("Connecting to global registries..."):
-        for lib in lib_list:
-            pypi, npm = get_pypi_data(lib), get_npm_data(lib)
-            if pypi: results.append(pypi)
-            if npm: results.append(npm)
-
-    if results:
-        df = pd.DataFrame(results)
-        st.success(f"✅ Telemetry acquired for {len(results)} assets.")
+    master_list = [l.strip() for l in libs_input.split(",") if l.strip()]
+    
+    if uploaded_file:
+        parsed_libs = parse_uploaded_file(uploaded_file)
+        master_list.extend(parsed_libs)
+        st.info(f"📄 Ingested {len(parsed_libs)} packages from {uploaded_file.name}")
         
-        # Dashboard Summary
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Assets", len(df))
-        c2.metric("Outdated Modules", len(df[df["Health Status"].str.contains("❌")]))
-        cve_count = len(df[df["Vulnerabilities"].str.contains("🚨")])
-        if cve_count > 0: c3.error(f"🚨 Critical CVEs: {cve_count}")
-        else: c3.success("✅ Perimeter Secure")
+    if github_url.strip():
+        gh_libs = fetch_github_repo(github_url.strip())
+        master_list.extend(gh_libs)
+        if gh_libs: st.info(f"🌐 Extracted {len(gh_libs)} dependencies from GitHub repository.")
+        else: st.warning("🌐 No valid dependency files found in that GitHub repository.")
 
-        # --- THE COOL VISUALIZATION (DONUT CHART) ---
-        st.markdown("### 📊 Ecosystem Health")
-        fig = px.pie(
-            df, 
-            names='Health Status', 
-            hole=0.65,
-            color_discrete_sequence=['#00FF41', '#FF4B4B', '#FFC107']
-        )
-        fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)", 
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="monospace", color="#E0E0E0")
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    master_list = list(dict.fromkeys(master_list))
 
-        # --- THE INTERACTIVE GRID ---
-        st.markdown("### 📋 Live Audit Data")
-        col_config = {"Source": st.column_config.LinkColumn("Repository", display_text="View ↗")}
-        st.data_editor(
-            df, 
-            use_container_width=True, 
-            column_config=col_config,
-            hide_index=True,
-            disabled=True # Prevents accidental edits
-        )
-        
-        # Export Options
-        st.markdown("---")
-        colA, colB = st.columns(2)
-        with colA: st.download_button("💾 Export CSV", df.to_csv(index=False).encode('utf-8'), "audit.csv", "text/csv", use_container_width=True)
-        with colB:
-            pdf_bytes = create_pdf(df)
-            if pdf_bytes: st.download_button("📄 Generate PDF Report", pdf_bytes, "audit.pdf", "application/pdf", use_container_width=True)
-    else:
-        st.error("Connection failed or no valid targets identified.")
+    if master_list:
+        final_data, visited = [], set()
+        with st.status(f"🕵️‍♂️ Scanning {len(master_list)} targets...", expanded=True) as status:
+            for lib in master_list:
+                if lib in visited: continue
+                visited.add(lib); st.write(f"Scanning target: `{lib}`...")
+                data = fetch_data(lib)
+                if data: final_data.extend(data)
+            status.update(label="Audit Complete!", state="complete", expanded=False)
+
+        if final_data:
+            df = pd.DataFrame(final_data)
+            st.markdown("### 📊 Threat Summary")
+            m1, m2 = st.columns(2)
+            m1.metric("Total Packages Scanned", len(df))
+            vuln_df = df[df['Status'].str.contains('Vulnerable|Error|Timeout', case=False, na=False)]
+            m2.metric("Critical Alerts", len(vuln_df))
+            
+            t1, t2 = st.tabs(["🚨 Active Threats", "📋 All Scanned Data"])
+            cfg = {"Source": st.column_config.LinkColumn("Repository"), "Description": st.column_config.TextColumn("Description", width="large")}
+            
+            with t1:
+                if not vuln_df.empty: st.data_editor(vuln_df, use_container_width=True, column_config=cfg, hide_index=True)
+                else: st.success("🎉 No vulnerabilities or timeouts found!")
+            with t2: st.data_editor(df, use_container_width=True, column_config=cfg, hide_index=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            with st.expander("📖 Library Profiles", expanded=False):
+                for item in final_data:
+                    st.markdown(f"**{item['Library']}** (`{item['Version']}`): {item['Description']}")
+        else: st.error("No valid registries responded.")
